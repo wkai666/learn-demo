@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"text/scanner"
 )
 
 type Expr interface {
@@ -130,7 +133,7 @@ func parseAndCheck(s string) (Expr, error) {
 		return nil, fmt.Errorf("empty expression")
 	}
 
-	expr, err := parse(s)
+	expr, err := Parse(s)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +152,153 @@ func parseAndCheck(s string) (Expr, error) {
 	return expr, nil
 }
 
+// ---- lexer ----
+
+// This lexer is similar to the one described in Chapter 13.
+type lexer struct {
+	scan  scanner.Scanner
+	token rune // current lookahead token
+}
+
+func (lex *lexer) next()        { lex.token = lex.scan.Scan() }
+func (lex *lexer) text() string { return lex.scan.TokenText() }
+
+type lexPanic string
+
+// describe returns a string describing the current token, for use in errors.
+func (lex *lexer) describe() string {
+	switch lex.token {
+	case scanner.EOF:
+		return "end of file"
+	case scanner.Ident:
+		return fmt.Sprintf("identifier %s", lex.text())
+	case scanner.Int, scanner.Float:
+		return fmt.Sprintf("number %s", lex.text())
+	}
+	return fmt.Sprintf("%q", rune(lex.token)) // any other rune
+}
+
+// Parse parses the input string as an arithmetic expression.
+//
+//   expr = num                         a literal number, e.g., 3.14159
+//        | id                          a variable name, e.g., x
+//        | id '(' expr ',' ... ')'     a function call
+//        | '-' expr                    a unary operator (+-)
+//        | expr '+' expr               a binary operator (+-*/)
+//
+func Parse(input string) (_ Expr, err error) {
+	defer func() {
+		switch x := recover().(type) {
+		case nil:
+			// no panic
+		case lexPanic:
+			err = fmt.Errorf("%s", x)
+		default:
+			// unexpected panic: resume state of panic.
+			panic(x)
+		}
+	}()
+	lex := new(lexer)
+	lex.scan.Init(strings.NewReader(input))
+	lex.scan.Mode = scanner.ScanIdents | scanner.ScanInts | scanner.ScanFloats
+	lex.next() // initial lookahead
+	e := parseExpr(lex)
+	if lex.token != scanner.EOF {
+		return nil, fmt.Errorf("unexpected %s", lex.describe())
+	}
+	return e, nil
+}
+
+func parseExpr(lex *lexer) Expr { return parseBinary(lex, 1) }
+
+// binary = unary ('+' binary)*
+// parseBinary stops when it encounters an
+// operator of lower precedence than prec1.
+func parseBinary(lex *lexer, prec1 int) Expr {
+	lhs := parseUnary(lex)
+	for prec := precedence(lex.token); prec >= prec1; prec-- {
+		for precedence(lex.token) == prec {
+			op := lex.token
+			lex.next() // consume operator
+			rhs := parseBinary(lex, prec+1)
+			lhs = binary{op, lhs, rhs}
+		}
+	}
+	return lhs
+}
+
+// unary = '+' expr | primary
+func parseUnary(lex *lexer) Expr {
+	if lex.token == '+' || lex.token == '-' {
+		op := lex.token
+		lex.next() // consume '+' or '-'
+		return unary{op, parseUnary(lex)}
+	}
+	return parsePrimary(lex)
+}
+
+func precedence(op rune) int {
+	switch op {
+	case '*', '/':
+		return 2
+	case '+', '-':
+		return 1
+	}
+	return 0
+}
+
+// primary = id
+//         | id '(' expr ',' ... ',' expr ')'
+//         | num
+//         | '(' expr ')'
+func parsePrimary(lex *lexer) Expr {
+	switch lex.token {
+	case scanner.Ident:
+		id := lex.text()
+		lex.next() // consume Ident
+		if lex.token != '(' {
+			return Var(id)
+		}
+		lex.next() // consume '('
+		var args []Expr
+		if lex.token != ')' {
+			for {
+				args = append(args, parseExpr(lex))
+				if lex.token != ',' {
+					break
+				}
+				lex.next() // consume ','
+			}
+			if lex.token != ')' {
+				msg := fmt.Sprintf("got %s, want ')'", lex.describe())
+				panic(lexPanic(msg))
+			}
+		}
+		lex.next() // consume ')'
+		return call{id, args}
+
+	case scanner.Int, scanner.Float:
+		f, err := strconv.ParseFloat(lex.text(), 64)
+		if err != nil {
+			panic(lexPanic(err.Error()))
+		}
+		lex.next() // consume number
+		return literal(f)
+
+	case '(':
+		lex.next() // consume '('
+		e := parseExpr(lex)
+		if lex.token != ')' {
+			msg := fmt.Sprintf("got %s, want ')'", lex.describe())
+			panic(lexPanic(msg))
+		}
+		lex.next() // consume ')'
+		return e
+	}
+	msg := fmt.Sprintf("unexpected %s", lex.describe())
+	panic(lexPanic(msg))
+}
+
 func plot(w http.ResponseWriter, req *http.Request) {
 	req.ParseForm()
 	expr, err := parseAndCheck(req.Form.Get("expr"))
@@ -162,4 +312,44 @@ func plot(w http.ResponseWriter, req *http.Request) {
 		r := math.Hypot(x, y)
 		return expr.Eval(Env{"x": x, "y": x, "r": r})
 	})
+}
+
+const (
+	width, height = 600, 320            // canvas size in pixels
+	cells         = 100                 // number of grid cells
+	xyrange       = 30.0                // x, y axis range (-xyrange..+xyrange)
+	xyscale       = width / 2 / xyrange // pixels per x or y unit
+	zscale        = height * 0.4        // pixels per z unit
+)
+
+var sin30, cos30 = 0.5, math.Sqrt(3.0 / 4.0) // sin(30°), cos(30°)
+
+func corner(f func(x, y float64) float64, i, j int) (float64, float64) {
+	// find point (x,y) at corner of cell (i,j)
+	x := xyrange * (float64(i)/cells - 0.5)
+	y := xyrange * (float64(j)/cells - 0.5)
+
+	z := f(x, y) // compute surface height z
+
+	// project (x,y,z) isometrically onto 2-D SVG canvas (sx,sy)
+	sx := width/2 + (x-y)*cos30*xyscale
+	sy := height/2 + (x+y)*sin30*xyscale - z*zscale
+	return sx, sy
+}
+
+func surface(w io.Writer, f func(x, y float64) float64) {
+	fmt.Fprintf(w, "<svg xmlns='http://www.w3.org/2000/svg' "+
+		"style='stroke: grey; fill: white; stroke-width: 0.7' "+
+		"width='%d' height='%d'>", width, height)
+	for i := 0; i < cells; i++ {
+		for j := 0; j < cells; j++ {
+			ax, ay := corner(f, i+1, j)
+			bx, by := corner(f, i, j)
+			cx, cy := corner(f, i, j+1)
+			dx, dy := corner(f, i+1, j+1)
+			fmt.Fprintf(w, "<polygon points='%g,%g %g,%g %g,%g %g,%g'/>\n",
+				ax, ay, bx, by, cx, cy, dx, dy)
+		}
+	}
+	fmt.Fprintln(w, "</svg>")
 }
